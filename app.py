@@ -150,11 +150,25 @@ def load_state() -> Dict[str, Any]:
 def load_predictions() -> pd.DataFrame:
     if not PREDICTIONS_CSV.exists():
         return pd.DataFrame()
+    warning_shown = False
     try:
         df = pd.read_csv(PREDICTIONS_CSV)
+    except pd.errors.ParserError:
+        try:
+            df = pd.read_csv(PREDICTIONS_CSV, engine="python", on_bad_lines="skip")
+            warning_shown = True
+        except Exception as exc:
+            st.error(f"Unable to read {PREDICTIONS_CSV}: {exc}")
+            return pd.DataFrame()
     except Exception as exc:
         st.error(f"Unable to read {PREDICTIONS_CSV}: {exc}")
         return pd.DataFrame()
+
+    if warning_shown:
+        st.warning(
+            "Certaines lignes malformées ont été ignorées lors du chargement de "
+            f"{PREDICTIONS_CSV.name}. Nettoyez le fichier si le problème persiste."
+        )
 
     if "datetime_paris" in df.columns:
         df["datetime_paris"] = pd.to_datetime(df["datetime_paris"], utc=True, errors="coerce").dt.tz_convert(TZ_PARIS)
