@@ -217,7 +217,17 @@ def save_state(state: Dict) -> None:
         state["trades"] = state["trades"][-2000:]
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(STATE_FILE)
+    max_attempts = 5
+    for attempt in range(max_attempts):
+        try:
+            tmp.replace(STATE_FILE)
+            break
+        except (PermissionError, OSError) as exc:
+            if attempt == max_attempts - 1:
+                print(f"[WARN] unable to persist state after {max_attempts} attempts: {exc}")
+                tmp.unlink(missing_ok=True)
+            else:
+                time.sleep(0.15)
 
 
 def load_thresholds() -> Optional[Dict[str, Dict[str, float]]]:
