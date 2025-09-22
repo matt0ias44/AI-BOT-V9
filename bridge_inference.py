@@ -126,6 +126,12 @@ def build_text_payload(title: str, summary: str, body: str) -> tuple[str, str, s
     return text_for_model or title_clean, titles_joined, body_concat, source
 
 
+def _flatten_for_csv(value: str) -> str:
+    if not value:
+        return ""
+    normalized = str(value).replace("\r", " ").replace("\n", " ")
+    return " ".join(normalized.split())
+
 
 def _clean_field(value: str | float | int | None) -> str:
     if value is None:
@@ -213,15 +219,28 @@ class MultiModalHead(nn.Module):
     def __init__(self, model_name: str, feat_dim: int, hidden_drop: float = 0.2):
         super().__init__()
         load_kwargs = {"use_safetensors": True, "low_cpu_mem_usage": True}
+
+        def _load_with_kwargs(kwargs: Dict) -> AutoModel:
+            try:
+                return AutoModel.from_pretrained(model_name, **kwargs)
+            except OSError as err:
+                if "paging file" in str(err).lower() or "1455" in str(err):
+                    retry_kwargs = dict(kwargs)
+                    retry_kwargs.pop("use_safetensors", None)
+                    return AutoModel.from_pretrained(model_name, **retry_kwargs)
+                raise
+
+        dtype_kwargs: Dict[str, object] = {}
         if DEVICE == "cuda":
-            load_kwargs["torch_dtype"] = torch.float16
+            dtype_kwargs["dtype"] = torch.float16
 
         try:
-            self.backbone = AutoModel.from_pretrained(model_name, **load_kwargs)
-        except OSError as err:
-            if "paging file" in str(err).lower() or "1455" in str(err):
-                load_kwargs.pop("use_safetensors", None)
-                self.backbone = AutoModel.from_pretrained(model_name, **load_kwargs)
+            self.backbone = _load_with_kwargs({**load_kwargs, **dtype_kwargs})
+        except TypeError as err:
+            if dtype_kwargs and ("dtype" in str(err) or "torch_dtype" in str(err)):
+                legacy_kwargs = dict(load_kwargs)
+                legacy_kwargs["torch_dtype"] = dtype_kwargs["dtype"]
+                self.backbone = _load_with_kwargs(legacy_kwargs)
             else:
                 raise
         hidden = self.backbone.config.hidden_size
@@ -269,6 +288,9 @@ class InferenceAssets:
     feat_norm: Dict[str, Dict[str, float]]
     feat_cols: List[str]
     thresholds: Optional[Dict[str, Dict[str, float]]]
+    best_epoch: Optional[int]
+    best_val_dir_mean_acc: Optional[float]
+    best_metrics: Optional[Dict[str, Dict[str, float]]]
 
 
 def load_model_assets(model_dir: Path) -> InferenceAssets:
@@ -279,7 +301,32 @@ def load_model_assets(model_dir: Path) -> InferenceAssets:
     tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
     model = MultiModalHead(model_name=str(model_dir), feat_dim=len(feat_cols)).to(DEVICE)
     state_path = model_dir / "multimodal_heads.pt"
-    model.load_state_dict(torch.load(state_path, map_location=DEVICE))
+    if not state_path.exists():
+        available = sorted(p.name for p in model_dir.glob("*.pt"))
+        hint = (
+            " Available checkpoints: " + ", ".join(available)
+            if available
+            else " No .pt files were found in the directory."
+        )
+        raise FileNotFoundError(
+            "Model checkpoint not found. Expected to load "
+            f"'{state_path}'. Either export the model weights by running "
+            "`train_model_v7_1_multi.py` (which writes multimodal_heads.pt) "
+            "or set the MODEL_DIR environment variable to point to a "
+            "directory that contains the exported checkpoint."
+            + hint
+        )
+
+    try:
+        state_dict = torch.load(
+            state_path, map_location=DEVICE, weights_only=True  # type: ignore[arg-type]
+        )
+    except TypeError:
+        # weights_only was introduced in newer torch releases. Fall back to the
+        # legacy call signature when running on older versions so the code keeps
+        # working without the new argument being available.
+        state_dict = torch.load(state_path, map_location=DEVICE)
+    model.load_state_dict(state_dict)
     model.eval()
 
     thresholds: Optional[Dict[str, Dict[str, float]]] = None
@@ -288,12 +335,93 @@ def load_model_assets(model_dir: Path) -> InferenceAssets:
         with open(thresh_path, "r", encoding="utf-8") as f:
             thresholds = json.load(f)
 
+    best_epoch: Optional[int] = None
+    best_val_dir_mean_acc: Optional[float] = None
+    best_metrics: Optional[Dict[str, Dict[str, float]]] = None
+
+    best_path = model_dir / "best.json"
+    if best_path.exists():
+        try:
+            best_payload = json.loads(best_path.read_text(encoding="utf-8"))
+            best_epoch_val = best_payload.get("epoch")
+            if isinstance(best_epoch_val, int):
+                best_epoch = best_epoch_val
+            best_metric_val = best_payload.get("val_dir_mean_acc")
+            if isinstance(best_metric_val, (int, float)):
+                best_val_dir_mean_acc = float(best_metric_val)
+        except Exception as exc:
+            print(f"[WARN] unable to read best.json: {exc}")
+
+    metrics_summary: Optional[Dict[str, Dict[str, float]]] = None
+    metrics_path = model_dir / "metrics_log.jsonl"
+    if best_epoch is not None and metrics_path.exists():
+        try:
+            with metrics_path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    payload = json.loads(line)
+                    if payload.get("epoch") == best_epoch:
+                        metrics_raw = payload.get("metrics") or {}
+                        metrics_summary = {}
+                        for horizon_key, metrics_values in metrics_raw.items():
+                            # json may encode horizon as string; ensure str keys
+                            horizon = str(horizon_key)
+                            if not isinstance(metrics_values, dict):
+                                continue
+                            filtered: Dict[str, float] = {}
+                            for metric_name in (
+                                "dir_acc",
+                                "dir_f1",
+                                "ret_mae",
+                                "mag_acc_cls",
+                                "mag_f1_cls",
+                                "ret_spearman",
+                            ):
+                                metric_val = metrics_values.get(metric_name)
+                                if isinstance(metric_val, (int, float)):
+                                    filtered[metric_name] = float(metric_val)
+                            if filtered:
+                                metrics_summary[horizon] = filtered
+                        break
+        except Exception as exc:
+            print(f"[WARN] unable to parse metrics_log.jsonl: {exc}")
+
+    if metrics_summary:
+        best_metrics = metrics_summary
+
+    if best_epoch is not None or best_val_dir_mean_acc is not None or best_metrics:
+        summary_parts: List[str] = []
+        if best_epoch is not None:
+            summary_parts.append(f"epoch={best_epoch}")
+        if best_val_dir_mean_acc is not None:
+            summary_parts.append(f"val_dir_mean_acc={best_val_dir_mean_acc:.3f}")
+        if best_metrics:
+            for horizon in ("30", "60", "120"):
+                horizon_metrics = best_metrics.get(horizon)
+                if not horizon_metrics:
+                    continue
+                horizon_parts = [
+                    f"{horizon}m dir_acc={horizon_metrics.get('dir_acc', float('nan')):.3f}",
+                    f"dir_f1={horizon_metrics.get('dir_f1', float('nan')):.3f}",
+                    f"ret_mae={horizon_metrics.get('ret_mae', float('nan')):.4f}",
+                ]
+                if "mag_acc_cls" in horizon_metrics:
+                    horizon_parts.append(
+                        f"mag_acc={horizon_metrics.get('mag_acc_cls', float('nan')):.3f}"
+                    )
+                summary_parts.append(" | ".join(horizon_parts))
+        print("[model] Loaded best checkpoint: " + " || ".join(summary_parts))
+
     return InferenceAssets(
         model=model,
         tokenizer=tokenizer,
         feat_norm=feat_norm,
         feat_cols=feat_cols,
         thresholds=thresholds,
+        best_epoch=best_epoch,
+        best_val_dir_mean_acc=best_val_dir_mean_acc,
+        best_metrics=best_metrics,
     )
 
 
@@ -525,12 +653,12 @@ def run_loop():
                     "mag_120m_pred": round(abs(ret_120), 6),
                     "mag_bucket": bucket,
                     "features_status": features_status,
-                    "title": title,
-                    "summary": summary,
+                    "title": _flatten_for_csv(title),
+                    "summary": _flatten_for_csv(summary),
                     "url": url,
                     "source": source,
-                    "titles_joined": titles_joined,
-                    "body_concat": body_concat,
+                    "titles_joined": _flatten_for_csv(titles_joined),
+                    "body_concat": _flatten_for_csv(body_concat),
                     "text_source": text_source,
                     "text_chars": int(text_chars),
                     "article_status": article_status,

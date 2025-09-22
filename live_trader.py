@@ -237,7 +237,7 @@ def latest_predictions(n: int = 40) -> pd.DataFrame:
     if not PRED_FILE.exists():
         return pd.DataFrame()
     try:
-        df = pd.read_csv(PRED_FILE)
+        df = pd.read_csv(PRED_FILE, engine="python", on_bad_lines="skip")
     except Exception as exc:
         print(f"[WARN] unable to read {PRED_FILE}: {exc}")
         return pd.DataFrame()
