@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Bridge inference v2.
@@ -291,7 +291,20 @@ def load_model_assets(model_dir: Path) -> InferenceAssets:
             "directory that contains the exported checkpoint."
         )
 
+
+    try:
+        state_dict = torch.load(
+            state_path, map_location=DEVICE, weights_only=True  # type: ignore[arg-type]
+        )
+    except TypeError:
+        # weights_only was introduced in newer torch releases. Fall back to the
+        # legacy call signature when running on older versions so the code keeps
+        # working without the new argument being available.
+        state_dict = torch.load(state_path, map_location=DEVICE)
+    model.load_state_dict(state_dict)
+=======
     model.load_state_dict(torch.load(state_path, map_location=DEVICE))
+
     model.eval()
 
     thresholds: Optional[Dict[str, Dict[str, float]]] = None
